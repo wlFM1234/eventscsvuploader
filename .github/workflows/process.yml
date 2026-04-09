@@ -1,0 +1,128 @@
+name: Process lead submission
+
+on:
+  push:
+    paths:
+      - 'submissions/*_leads.csv'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Find submission files
+        id: find
+        run: |
+          # Get the most recently added CSV from the push
+          CSV_FILE=$(git diff-tree --no-commit-id -r --name-only ${{ github.sha }} | grep 'submissions/.*_leads\.csv' | head -1)
+          if [ -z "$CSV_FILE" ]; then
+            echo "No CSV found in this push — skipping."
+            exit 0
+          fi
+          TIMESTAMP=$(basename "$CSV_FILE" _leads.csv)
+          META_FILE="submissions/${TIMESTAMP}_meta.json"
+          echo "csv=$CSV_FILE" >> $GITHUB_OUTPUT
+          echo "meta=$META_FILE" >> $GITHUB_OUTPUT
+          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+
+      - name: Validate & summarise CSV
+        if: steps.find.outputs.csv != ''
+        id: validate
+        run: |
+          node - <<'EOF'
+          const fs = require('fs');
+          const csvPath  = '${{ steps.find.outputs.csv }}';
+          const metaPath = '${{ steps.find.outputs.meta }}';
+
+          const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+          const lines = fs.readFileSync(csvPath, 'utf8').trim().split(/\r?\n/);
+          const headers = lines[0].split(',');
+          const rows = lines.slice(1).map(l => {
+            const cols = []; let cur='', inQ=false;
+            for (const c of l) {
+              if (c==='"') inQ=!inQ;
+              else if (c===',' && !inQ) { cols.push(cur.trim()); cur=''; }
+              else cur += c;
+            }
+            cols.push(cur.trim());
+            return Object.fromEntries(headers.map((h,i)=>[h,(cols[i]||'').replace(/^"|"$/g,'')]));
+          }).filter(r => Object.values(r).some(v=>v));
+
+          const emailIdx = headers.indexOf('email');
+          const issues = [];
+
+          if (emailIdx < 0) issues.push('ERROR: no email column found');
+
+          const badEmails = rows.filter(r => r.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(r.email));
+          if (badEmails.length) issues.push(`WARN: ${badEmails.length} invalid email(s)`);
+
+          const emails = rows.map(r=>r.email).filter(Boolean);
+          const dupes = emails.length - new Set(emails).size;
+          if (dupes) issues.push(`WARN: ${dupes} duplicate email(s)`);
+
+          const REQUIRED = ['firstName','lastName','email'];
+          REQUIRED.forEach(f => { if (!headers.includes(f)) issues.push(`ERROR: missing required field — ${f}`); });
+
+          const hasErrors = issues.some(i=>i.startsWith('ERROR'));
+
+          const summary = {
+            sender: meta.sender,
+            notes: meta.notes,
+            destination: meta.destination,
+            originalFile: meta.originalFile,
+            submittedAt: meta.submittedAt,
+            rowCount: rows.length,
+            issues,
+            hasErrors
+          };
+
+          fs.writeFileSync('submissions/${{ steps.find.outputs.timestamp }}_summary.json', JSON.stringify(summary, null, 2));
+
+          // Write to GITHUB_OUTPUT
+          const out = process.env.GITHUB_OUTPUT;
+          fs.appendFileSync(out, `row_count=${rows.length}\n`);
+          fs.appendFileSync(out, `has_errors=${hasErrors}\n`);
+          fs.appendFileSync(out, `destination=${meta.destination}\n`);
+          fs.appendFileSync(out, `sender=${meta.sender}\n`);
+          fs.appendFileSync(out, `issue_count=${issues.length}\n`);
+          fs.appendFileSync(out, `notes=${meta.notes||''}\n`);
+
+          console.log('=== Validation summary ===');
+          console.log(JSON.stringify(summary, null, 2));
+          EOF
+
+      - name: Print approval instructions
+        if: steps.find.outputs.csv != ''
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  SUBMISSION READY FOR REVIEW"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  Sender     : ${{ steps.validate.outputs.sender }}"
+          echo "  Rows       : ${{ steps.validate.outputs.row_count }}"
+          echo "  Destination: ${{ steps.validate.outputs.destination }}"
+          echo "  Notes      : ${{ steps.validate.outputs.notes }}"
+          echo "  Issues     : ${{ steps.validate.outputs.issue_count }}"
+          echo ""
+          if [ "${{ steps.validate.outputs.has_errors }}" = "true" ]; then
+            echo "  ❌  ERRORS found — fix before approving"
+          else
+            echo "  ✅  To approve and push to Marketo, run:"
+            echo ""
+            echo "  Go to: Actions → 'Approve & upload to Marketo'"
+            echo "  Click 'Run workflow' and enter:"
+            echo "    timestamp = ${{ steps.find.outputs.timestamp }}"
+            echo ""
+          fi
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
