@@ -140,16 +140,17 @@ jobs:
             const leadIds = upsertRes.result.filter(r => r.status !== 'skipped').map(r => r.id);
             console.log(`✓ ${leadIds.length} leads upserted`);
 
-            // 4. Create static list
+            // 4. Create static list in folder 14632
             console.log(`→ Creating static list "${LIST_NAME}"...`);
+            const createBody = `folder={"id":14632,"type":"Folder"}&name=${encodeURIComponent(LIST_NAME)}`;
             const createListRes = await request(`${BASE}/rest/asset/v1/staticLists.json`, {
               method: 'POST',
               headers: {
                 'Authorization': `Bearer ${token}`,
                 'Content-Type': 'application/x-www-form-urlencoded',
-                'Content-Length': Buffer.byteLength(`name=${encodeURIComponent(LIST_NAME)}`)
+                'Content-Length': Buffer.byteLength(createBody)
               },
-              body: `name=${encodeURIComponent(LIST_NAME)}`
+              body: createBody
             });
 
             let listId;
@@ -160,7 +161,7 @@ jobs:
               // List may already exist — try to find it
               console.log(`⚠ Could not create list, searching for existing "${LIST_NAME}"...`);
               const searchRes = await request(
-                `${BASE}/rest/asset/v1/staticLists.json?name=${encodeURIComponent(LIST_NAME)}`,
+                `${BASE}/rest/asset/v1/staticList/byName.json?name=${encodeURIComponent(LIST_NAME)}`,
                 { headers: { 'Authorization': `Bearer ${token}` } }
               );
               if (!searchRes.success || !searchRes.result?.[0]?.id) {
