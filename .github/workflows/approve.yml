@@ -1,0 +1,199 @@
+name: Approve & upload to Marketo
+
+on:
+  workflow_dispatch:
+    inputs:
+      timestamp:
+        description: 'Submission timestamp (from the process workflow log)'
+        required: true
+        type: string
+      destination:
+        description: 'Marketo destination — e.g. list:emea-q2 or prog:nurture'
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run — validate only, do not push to Marketo'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate submission exists
+        id: check
+        run: |
+          CSV="submissions/${{ github.event.inputs.timestamp }}_leads.csv"
+          META="submissions/${{ github.event.inputs.timestamp }}_meta.json"
+          SUMMARY="submissions/${{ github.event.inputs.timestamp }}_summary.json"
+
+          if [ ! -f "$CSV" ]; then
+            echo "❌ CSV not found: $CSV"
+            exit 1
+          fi
+          if [ ! -f "$META" ]; then
+            echo "❌ Meta not found: $META"
+            exit 1
+          fi
+
+          echo "csv=$CSV"     >> $GITHUB_OUTPUT
+          echo "meta=$META"   >> $GITHUB_OUTPUT
+
+          cat "$META"
+          if [ -f "$SUMMARY" ]; then
+            echo "--- Summary ---"
+            cat "$SUMMARY"
+          fi
+
+      - name: Authenticate with Marketo & upload
+        if: github.event.inputs.dry_run == 'false'
+        env:
+          MARKETO_BASE_URL:    ${{ secrets.MARKETO_BASE_URL }}
+          MARKETO_CLIENT_ID:   ${{ secrets.MARKETO_CLIENT_ID }}
+          MARKETO_CLIENT_SECRET: ${{ secrets.MARKETO_CLIENT_SECRET }}
+        run: |
+          node - <<'EOF'
+          const fs   = require('fs');
+          const https = require('https');
+
+          const BASE_URL       = process.env.MARKETO_BASE_URL;       // e.g. https://123-ABC-456.mktorest.com
+          const CLIENT_ID      = process.env.MARKETO_CLIENT_ID;
+          const CLIENT_SECRET  = process.env.MARKETO_CLIENT_SECRET;
+
+          const meta   = JSON.parse(fs.readFileSync('${{ steps.check.outputs.meta }}', 'utf8'));
+            meta.destination = '${{ github.event.inputs.destination }}';
+          const csvRaw = fs.readFileSync('${{ steps.check.outputs.csv }}', 'utf8');
+
+          // ── helpers ────────────────────────────────────────────────────
+          function fetchJSON(url, opts={}) {
+            return new Promise((res, rej) => {
+              const req = https.request(url, opts, r => {
+                let body = '';
+                r.on('data', d => body += d);
+                r.on('end', () => {
+                  try { res(JSON.parse(body)); } catch(e) { rej(new Error('JSON parse failed: '+body)); }
+                });
+              });
+              req.on('error', rej);
+              if (opts.body) req.write(opts.body);
+              req.end();
+            });
+          }
+
+          async function main() {
+            // 1. Get access token
+            console.log('→ Fetching Marketo access token...');
+            const tokenUrl = `${BASE_URL}/identity/oauth/token?grant_type=client_credentials&client_id=${CLIENT_ID}&client_secret=${CLIENT_SECRET}`;
+            const tokenData = await fetchJSON(tokenUrl);
+            if (!tokenData.access_token) throw new Error('Auth failed: '+JSON.stringify(tokenData));
+            const token = tokenData.access_token;
+            console.log('✓ Authenticated');
+
+            // 2. Parse CSV → array of lead objects
+            const lines   = csvRaw.trim().split(/\r?\n/);
+            const headers = lines[0].split(',');
+            const leads   = lines.slice(1).map(line => {
+              const cols = []; let cur='', inQ=false;
+              for (const c of line) {
+                if (c==='"') inQ=!inQ;
+                else if (c===',' && !inQ) { cols.push(cur.trim()); cur=''; }
+                else cur += c;
+              }
+              cols.push(cur.trim());
+              const obj = {};
+              headers.forEach((h,i) => { obj[h] = (cols[i]||'').replace(/^"|"$/g,''); });
+              return obj;
+            }).filter(r => Object.values(r).some(v=>v));
+
+            console.log(`→ Uploading ${leads.length} leads to ${meta.destination}...`);
+
+            // 3. Upsert leads (createOrUpdate by email)
+            const payload = JSON.stringify({
+              action:      'createOrUpdate',
+              lookupField: 'email',
+              input:       leads
+            });
+
+            const upsertRes = await fetchJSON(`${BASE_URL}/rest/v1/leads.json`, {
+              method:  'POST',
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type':  'application/json',
+                'Content-Length': Buffer.byteLength(payload)
+              },
+              body: payload
+            });
+
+            if (!upsertRes.success) throw new Error('Upsert failed: '+JSON.stringify(upsertRes.errors));
+            console.log('✓ Leads upserted:', JSON.stringify(upsertRes.result?.slice(0,3)));
+
+            // 4. If destination is a static list, add leads to it
+            if (meta.destination.startsWith('list:')) {
+              const listName = meta.destination.replace('list:', '');
+
+              // find list ID by name
+              const listSearch = await fetchJSON(
+                `${BASE_URL}/rest/asset/v1/staticLists.json?name=${encodeURIComponent(listName)}`,
+                { headers: { 'Authorization': `Bearer ${token}` } }
+              );
+              const listId = listSearch.result?.[0]?.id;
+              if (!listId) { console.warn(`⚠ List "${listName}" not found — leads upserted but not added to list`); return; }
+
+              const leadIds = upsertRes.result.filter(r=>r.status!=='skipped').map(r=>r.id);
+              const addRes = await fetchJSON(
+                `${BASE_URL}/rest/v1/lists/${listId}/leads.json?id=${leadIds.join('&id=')}`,
+                { method: 'POST', headers: { 'Authorization': `Bearer ${token}` } }
+              );
+              if (!addRes.success) console.warn('⚠ Could not add to list:', JSON.stringify(addRes.errors));
+              else console.log(`✓ Added ${leadIds.length} lead(s) to list ${listId}`);
+            }
+
+            // 5. If destination is a program, add to program
+            if (meta.destination.startsWith('prog:')) {
+              const progName = meta.destination.replace('prog:', '');
+              console.log(`ℹ Program membership for "${progName}" — add manually or extend this script with program API calls`);
+            }
+
+            console.log('');
+            console.log('🎉 Upload complete!');
+          }
+
+          main().catch(err => { console.error('❌', err.message); process.exit(1); });
+          EOF
+
+      - name: Dry run summary
+        if: github.event.inputs.dry_run == 'true'
+        run: |
+          echo "🔎 DRY RUN — no data sent to Marketo"
+          echo "CSV: ${{ steps.check.outputs.csv }}"
+          cat ${{ steps.check.outputs.meta }}
+
+      - name: Archive processed submission
+        if: github.event.inputs.dry_run == 'false'
+        run: |
+          TS="${{ github.event.inputs.timestamp }}"
+          mkdir -p submissions/processed
+          mv submissions/${TS}_leads.csv    submissions/processed/ || true
+          mv submissions/${TS}_meta.json    submissions/processed/ || true
+          mv submissions/${TS}_summary.json submissions/processed/ || true
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add submissions/
+          git commit -m "[done] Archived submission ${TS}" || echo "Nothing to commit"
+          git push
