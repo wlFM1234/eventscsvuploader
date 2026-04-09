@@ -149,8 +149,11 @@ jobs:
               { headers: { 'Authorization': `Bearer ${token}` } }
             );
 
+            console.log('→ Folders API response:', JSON.stringify(foldersRes).slice(0, 2000));
+
             let folderId = null, folderType = 'Folder';
             if (foldersRes.success && foldersRes.result) {
+              console.log('→ Available folders:', foldersRes.result.map(f => `${f.name} (id:${f.id} type:${f.type})`).join(', '));
               const match = foldersRes.result.find(f => f.name === FOLDER_NAME);
               if (match) { folderId = match.id; folderType = match.type || 'Folder'; }
             }
