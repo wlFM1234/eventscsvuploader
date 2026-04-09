@@ -1,0 +1,222 @@
+name: Approve & upload to Marketo
+
+on:
+  workflow_dispatch:
+    inputs:
+      timestamp:
+        description: 'Submission timestamp (from the process workflow log)'
+        required: true
+        type: string
+      list_name:
+        description: 'Marketo static list name to create and add leads to'
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run — validate only, do not push to Marketo'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate submission exists
+        id: check
+        run: |
+          CSV="submissions/${{ github.event.inputs.timestamp }}_leads.csv"
+          META="submissions/${{ github.event.inputs.timestamp }}_meta.json"
+
+          if [ ! -f "$CSV" ]; then
+            echo "❌ CSV not found: $CSV"
+            exit 1
+          fi
+          if [ ! -f "$META" ]; then
+            echo "❌ Meta not found: $META"
+            exit 1
+          fi
+
+          echo "csv=$CSV" >> $GITHUB_OUTPUT
+          echo "meta=$META" >> $GITHUB_OUTPUT
+          echo "✅ Found submission:"
+          cat "$META"
+
+      - name: Upload to Marketo
+        if: github.event.inputs.dry_run == 'false'
+        env:
+          MARKETO_BASE_URL:      ${{ secrets.MARKETO_BASE_URL }}
+          MARKETO_CLIENT_ID:     ${{ secrets.MARKETO_CLIENT_ID }}
+          MARKETO_CLIENT_SECRET: ${{ secrets.MARKETO_CLIENT_SECRET }}
+          LIST_NAME:             ${{ github.event.inputs.list_name }}
+        run: |
+          node - <<'EOF'
+          const fs    = require('fs');
+          const https = require('https');
+
+          const BASE          = process.env.MARKETO_BASE_URL;
+          const CLIENT_ID     = process.env.MARKETO_CLIENT_ID;
+          const CLIENT_SECRET = process.env.MARKETO_CLIENT_SECRET;
+          const LIST_NAME     = process.env.LIST_NAME;
+
+          const csvRaw = fs.readFileSync('${{ steps.check.outputs.csv }}', 'utf8');
+          const meta   = JSON.parse(fs.readFileSync('${{ steps.check.outputs.meta }}', 'utf8'));
+
+          // ── HTTP helper ────────────────────────────────────────────────
+          function request(url, opts = {}) {
+            return new Promise((res, rej) => {
+              const req = https.request(url, opts, r => {
+                let body = '';
+                r.on('data', d => body += d);
+                r.on('end', () => {
+                  try { res(JSON.parse(body)); }
+                  catch(e) { rej(new Error('JSON parse failed: ' + body)); }
+                });
+              });
+              req.on('error', rej);
+              if (opts.body) req.write(opts.body);
+              req.end();
+            });
+          }
+
+          async function main() {
+            // 1. Authenticate
+            console.log('→ Authenticating with Marketo...');
+            const tokenRes = await request(
+              `${BASE}/identity/oauth/token?grant_type=client_credentials&client_id=${CLIENT_ID}&client_secret=${CLIENT_SECRET}`
+            );
+            if (!tokenRes.access_token) throw new Error('Auth failed: ' + JSON.stringify(tokenRes));
+            const token = tokenRes.access_token;
+            console.log('✓ Authenticated');
+
+            // 2. Parse CSV
+            const lines   = csvRaw.trim().split(/\r?\n/);
+            const headers = lines[0].split(',');
+            const leads   = lines.slice(1).map(line => {
+              const cols = []; let cur = '', inQ = false;
+              for (const c of line) {
+                if (c === '"') inQ = !inQ;
+                else if (c === ',' && !inQ) { cols.push(cur.trim()); cur = ''; }
+                else cur += c;
+              }
+              cols.push(cur.trim());
+              const obj = {};
+              headers.forEach((h, i) => { obj[h] = (cols[i] || '').replace(/^"|"$/g, ''); });
+              return obj;
+            }).filter(r => Object.values(r).some(v => v));
+
+            console.log(`→ ${leads.length} leads to process`);
+
+            // 3. Upsert leads
+            console.log('→ Upserting leads...');
+            const upsertPayload = JSON.stringify({
+              action: 'createOrUpdate',
+              lookupField: 'email',
+              input: leads
+            });
+            const upsertRes = await request(`${BASE}/rest/v1/leads.json`, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(upsertPayload)
+              },
+              body: upsertPayload
+            });
+            if (!upsertRes.success) throw new Error('Upsert failed: ' + JSON.stringify(upsertRes.errors));
+            const leadIds = upsertRes.result.filter(r => r.status !== 'skipped').map(r => r.id);
+            console.log(`✓ ${leadIds.length} leads upserted`);
+
+            // 4. Create static list
+            console.log(`→ Creating static list "${LIST_NAME}"...`);
+            const createListRes = await request(`${BASE}/rest/asset/v1/staticLists.json`, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Content-Length': Buffer.byteLength(`name=${encodeURIComponent(LIST_NAME)}`)
+              },
+              body: `name=${encodeURIComponent(LIST_NAME)}`
+            });
+
+            let listId;
+            if (createListRes.success && createListRes.result?.[0]?.id) {
+              listId = createListRes.result[0].id;
+              console.log(`✓ Created list "${LIST_NAME}" with ID ${listId}`);
+            } else {
+              // List may already exist — try to find it
+              console.log(`⚠ Could not create list, searching for existing "${LIST_NAME}"...`);
+              const searchRes = await request(
+                `${BASE}/rest/asset/v1/staticLists.json?name=${encodeURIComponent(LIST_NAME)}`,
+                { headers: { 'Authorization': `Bearer ${token}` } }
+              );
+              if (!searchRes.success || !searchRes.result?.[0]?.id) {
+                throw new Error('Could not create or find list: ' + JSON.stringify(createListRes.errors));
+              }
+              listId = searchRes.result[0].id;
+              console.log(`✓ Found existing list "${LIST_NAME}" with ID ${listId}`);
+            }
+
+            // 5. Add leads to list (batch in groups of 300)
+            console.log(`→ Adding ${leadIds.length} leads to list ${listId}...`);
+            const batchSize = 300;
+            for (let i = 0; i < leadIds.length; i += batchSize) {
+              const batch = leadIds.slice(i, i + batchSize);
+              const addRes = await request(
+                `${BASE}/rest/v1/lists/${listId}/leads.json`,
+                {
+                  method: 'POST',
+                  headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(JSON.stringify({ input: batch.map(id => ({ id })) }))
+                  },
+                  body: JSON.stringify({ input: batch.map(id => ({ id })) })
+                }
+              );
+              if (!addRes.success) throw new Error('Add to list failed: ' + JSON.stringify(addRes.errors));
+              console.log(`✓ Batch ${Math.floor(i/batchSize)+1}: added ${batch.length} leads`);
+            }
+
+            console.log('');
+            console.log(`🎉 Done! ${leadIds.length} leads uploaded and added to "${LIST_NAME}"`);
+          }
+
+          main().catch(err => { console.error('❌', err.message); process.exit(1); });
+          EOF
+
+      - name: Dry run summary
+        if: github.event.inputs.dry_run == 'true'
+        run: |
+          echo "🔎 DRY RUN — no data sent to Marketo"
+          echo "Would create list: ${{ github.event.inputs.list_name }}"
+          echo "CSV: ${{ steps.check.outputs.csv }}"
+          cat ${{ steps.check.outputs.meta }}
+
+      - name: Archive processed submission
+        if: github.event.inputs.dry_run == 'false'
+        run: |
+          TS="${{ github.event.inputs.timestamp }}"
+          mkdir -p submissions/processed
+          mv submissions/${TS}_leads.csv    submissions/processed/ || true
+          mv submissions/${TS}_meta.json    submissions/processed/ || true
+          mv submissions/${TS}_summary.json submissions/processed/ || true
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add submissions/
+          git commit -m "[done] Archived submission ${TS} → ${{ github.event.inputs.list_name }}" || echo "Nothing to commit"
+          git push
