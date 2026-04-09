@@ -142,7 +142,7 @@ jobs:
 
             // 4. Create static list in folder 14632
             console.log(`→ Creating static list "${LIST_NAME}"...`);
-            const createBody = `folder={"id":14632,"type":"Folder"}&name=${encodeURIComponent(LIST_NAME)}`;
+            const createBody = `folder={"id":14294,"type":"Folder"}&name=${encodeURIComponent(LIST_NAME)}`;
             const createListRes = await request(`${BASE}/rest/asset/v1/staticLists.json`, {
               method: 'POST',
               headers: {
