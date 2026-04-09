@@ -61,7 +61,6 @@ jobs:
           MARKETO_BASE_URL:      ${{ secrets.MARKETO_BASE_URL }}
           MARKETO_CLIENT_ID:     ${{ secrets.MARKETO_CLIENT_ID }}
           MARKETO_CLIENT_SECRET: ${{ secrets.MARKETO_CLIENT_SECRET }}
-          MARKETO_FOLDER_NAME:   ${{ secrets.MARKETO_FOLDER_NAME }}
           LIST_NAME:             ${{ github.event.inputs.list_name }}
         run: |
           node - <<'EOF'
@@ -72,7 +71,6 @@ jobs:
           const CLIENT_ID     = process.env.MARKETO_CLIENT_ID;
           const CLIENT_SECRET = process.env.MARKETO_CLIENT_SECRET;
           const LIST_NAME     = process.env.LIST_NAME;
-          const FOLDER_NAME   = process.env.MARKETO_FOLDER_NAME;
 
           const csvRaw = fs.readFileSync('${{ steps.check.outputs.csv }}', 'utf8');
           const meta   = JSON.parse(fs.readFileSync('${{ steps.check.outputs.meta }}', 'utf8'));
@@ -142,44 +140,9 @@ jobs:
             const leadIds = upsertRes.result.filter(r => r.status !== 'skipped').map(r => r.id);
             console.log(`✓ ${leadIds.length} leads upserted`);
 
-            // 4. Find Lead Database folder by name, then create static list
-            console.log(`→ Looking up folder "${FOLDER_NAME}" in Lead Database...`);
-
-            // Lead Database folders live under root type "Folder" but need to be
-            // browsed with isArchive=false and root set to the Lead Database root
-            let folderId = null, folderType = 'Folder';
-
-            // Try browsing with no root first (returns all accessible folders)
-            for (const rootType of ['Folder', 'Program']) {
-              const res = await request(
-                `${BASE}/rest/asset/v1/folders.json?maxReturn=200&root={"id":0,"type":"${rootType}"}`,
-                { headers: { 'Authorization': `Bearer ${token}` } }
-              );
-              if (res.success && res.result) {
-                console.log(`Root ${rootType} folders:`, res.result.map(f=>`${f.name}(${f.id}/${f.type})`).join(', '));
-                const match = res.result.find(f => f.name === FOLDER_NAME);
-                if (match) { folderId = match.id; folderType = match.type; break; }
-              }
-            }
-
-            // Also try flat browse with no root
-            if (!folderId) {
-              const res = await request(
-                `${BASE}/rest/asset/v1/folders.json?maxReturn=200`,
-                { headers: { 'Authorization': `Bearer ${token}` } }
-              );
-              if (res.success && res.result) {
-                console.log('Flat folders:', res.result.map(f=>`${f.name}(${f.id}/${f.type})`).join(', '));
-                const match = res.result.find(f => f.name === FOLDER_NAME);
-                if (match) { folderId = match.id; folderType = match.type; }
-              }
-            }
-
-            if (!folderId) throw new Error(`Folder "${FOLDER_NAME}" not found in any browse result. See folder names above.`);
-            console.log(`✓ Found folder "${FOLDER_NAME}" id=${folderId} type=${folderType}`);
-
+            // 4. Create static list in Group Lists (id=12)
             console.log(`→ Creating static list "${LIST_NAME}"...`);
-            const createBody = `folder={"id":${folderId},"type":"${folderType}"}&name=${encodeURIComponent(LIST_NAME)}`;
+            const createBody = `folder={"id":12,"type":"Folder"}&name=${encodeURIComponent(LIST_NAME)}`;
             const createListRes = await request(`${BASE}/rest/asset/v1/staticLists.json`, {
               method: 'POST',
               headers: {
