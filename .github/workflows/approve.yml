@@ -61,6 +61,7 @@ jobs:
           MARKETO_BASE_URL:      ${{ secrets.MARKETO_BASE_URL }}
           MARKETO_CLIENT_ID:     ${{ secrets.MARKETO_CLIENT_ID }}
           MARKETO_CLIENT_SECRET: ${{ secrets.MARKETO_CLIENT_SECRET }}
+          MARKETO_FOLDER_NAME:   ${{ secrets.MARKETO_FOLDER_NAME }}
           LIST_NAME:             ${{ github.event.inputs.list_name }}
         run: |
           node - <<'EOF'
@@ -71,6 +72,7 @@ jobs:
           const CLIENT_ID     = process.env.MARKETO_CLIENT_ID;
           const CLIENT_SECRET = process.env.MARKETO_CLIENT_SECRET;
           const LIST_NAME     = process.env.LIST_NAME;
+          const FOLDER_NAME   = process.env.MARKETO_FOLDER_NAME;
 
           const csvRaw = fs.readFileSync('${{ steps.check.outputs.csv }}', 'utf8');
           const meta   = JSON.parse(fs.readFileSync('${{ steps.check.outputs.meta }}', 'utf8'));
@@ -140,9 +142,23 @@ jobs:
             const leadIds = upsertRes.result.filter(r => r.status !== 'skipped').map(r => r.id);
             console.log(`✓ ${leadIds.length} leads upserted`);
 
-            // 4. Create static list in folder 14632
+            // 4. Find folder by name via API, then create the static list
+            console.log(`→ Finding Lead Database folder "${FOLDER_NAME}"...`);
+            const foldersRes = await request(
+              `${BASE}/rest/asset/v1/folders.json?maxReturn=200`,
+              { headers: { 'Authorization': `Bearer ${token}` } }
+            );
+
+            let folderId = null, folderType = 'Folder';
+            if (foldersRes.success && foldersRes.result) {
+              const match = foldersRes.result.find(f => f.name === FOLDER_NAME);
+              if (match) { folderId = match.id; folderType = match.type || 'Folder'; }
+            }
+            if (!folderId) throw new Error(`Folder "${FOLDER_NAME}" not found. Check MARKETO_FOLDER_NAME secret matches exactly.`);
+            console.log(`✓ Found folder "${FOLDER_NAME}" with ID ${folderId}`);
+
             console.log(`→ Creating static list "${LIST_NAME}"...`);
-            const createBody = `folder={"id":14294,"type":"Folder"}&name=${encodeURIComponent(LIST_NAME)}`;
+            const createBody = `folder={"id":${folderId},"type":"${folderType}"}&name=${encodeURIComponent(LIST_NAME)}`;
             const createListRes = await request(`${BASE}/rest/asset/v1/staticLists.json`, {
               method: 'POST',
               headers: {
@@ -158,15 +174,13 @@ jobs:
               listId = createListRes.result[0].id;
               console.log(`✓ Created list "${LIST_NAME}" with ID ${listId}`);
             } else {
-              // List may already exist — try to find it
               console.log(`⚠ Could not create list, searching for existing "${LIST_NAME}"...`);
               const searchRes = await request(
                 `${BASE}/rest/asset/v1/staticList/byName.json?name=${encodeURIComponent(LIST_NAME)}`,
                 { headers: { 'Authorization': `Bearer ${token}` } }
               );
-              if (!searchRes.success || !searchRes.result?.[0]?.id) {
+              if (!searchRes.success || !searchRes.result?.[0]?.id)
                 throw new Error('Could not create or find list: ' + JSON.stringify(createListRes.errors));
-              }
               listId = searchRes.result[0].id;
               console.log(`✓ Found existing list "${LIST_NAME}" with ID ${listId}`);
             }
