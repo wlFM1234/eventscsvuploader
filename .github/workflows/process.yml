@@ -93,7 +93,6 @@ jobs:
           const out = process.env.GITHUB_OUTPUT;
           fs.appendFileSync(out, `row_count=${rows.length}\n`);
           fs.appendFileSync(out, `has_errors=${hasErrors}\n`);
-          fs.appendFileSync(out, `destination=${meta.destination}\n`);
           fs.appendFileSync(out, `sender=${meta.sender}\n`);
           fs.appendFileSync(out, `issue_count=${issues.length}\n`);
           fs.appendFileSync(out, `notes=${meta.notes||''}\n`);
@@ -111,7 +110,6 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "  Sender     : ${{ steps.validate.outputs.sender }}"
           echo "  Rows       : ${{ steps.validate.outputs.row_count }}"
-          echo "  Destination: ${{ steps.validate.outputs.destination }}"
           echo "  Notes      : ${{ steps.validate.outputs.notes }}"
           echo "  Issues     : ${{ steps.validate.outputs.issue_count }}"
           echo ""
