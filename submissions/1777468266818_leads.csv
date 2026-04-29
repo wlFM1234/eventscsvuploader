@@ -1,0 +1,4 @@
+firstName,lastName,email,company,title,phone,Marketo_Country_Picklist__c
+"Alice","Smith","alice@acme.com","Acme Corp","VP Sales","+44 7700 900001","UK"
+"Bob","Jones","bob@globex.com","Globex","Engineer","+1 555 0100","US"
+"Carol","Brown","carol@initech.com","Initech","Director","","UK"
