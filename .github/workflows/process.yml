@@ -9,7 +9,7 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       actions: write
 
     steps:
@@ -40,8 +40,17 @@ jobs:
 
           TIMESTAMP=$(basename "$CSV_FILE" _leads.csv)
           META_FILE="submissions/${TIMESTAMP}_meta.json"
+
+          # Meta file may not have landed yet — retry for up to 30 seconds
+          for i in 1 2 3 4 5 6; do
+            if [ -f "$META_FILE" ]; then break; fi
+            echo "Waiting for meta file... attempt $i"
+            sleep 5
+            git pull --quiet
+          done
+
           if [ ! -f "$META_FILE" ]; then
-            echo "Meta file not found for $CSV_FILE — skipping."
+            echo "Meta file not found after retries — skipping."
             exit 0
           fi
           echo "Found: $CSV_FILE (timestamp: $TIMESTAMP)"
