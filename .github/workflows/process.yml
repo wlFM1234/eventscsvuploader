@@ -24,19 +24,27 @@ jobs:
       - name: Find submission files
         id: find
         run: |
-          # Find the newest CSV in submissions/ (folder scan, not git diff)
-          CSV_FILE=$(ls -t submissions/*_leads.csv 2>/dev/null | head -1)
+          # Try to get the exact CSV from this commit first
+          CSV_FILE=$(git diff-tree --no-commit-id -r --name-only ${{ github.sha }} | grep 'submissions/.*_leads\.csv' | head -1)
+
+          # Fallback: find newest by filename timestamp if diff-tree misses it
           if [ -z "$CSV_FILE" ]; then
-            echo "No CSV found in submissions/ — skipping."
+            echo "diff-tree found nothing, falling back to newest filename..."
+            CSV_FILE=$(ls submissions/*_leads.csv 2>/dev/null | sort -V | tail -1)
+          fi
+
+          if [ -z "$CSV_FILE" ]; then
+            echo "No CSV found — skipping."
             exit 0
           fi
+
           TIMESTAMP=$(basename "$CSV_FILE" _leads.csv)
           META_FILE="submissions/${TIMESTAMP}_meta.json"
           if [ ! -f "$META_FILE" ]; then
             echo "Meta file not found for $CSV_FILE — skipping."
             exit 0
           fi
-          echo "Found: $CSV_FILE"
+          echo "Found: $CSV_FILE (timestamp: $TIMESTAMP)"
           echo "csv=$CSV_FILE" >> $GITHUB_OUTPUT
           echo "meta=$META_FILE" >> $GITHUB_OUTPUT
           echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
@@ -54,25 +62,21 @@ jobs:
           const lines = fs.readFileSync(csvPath, 'utf8').trim().split(/\r?\n/);
           const headers = lines[0].split(',');
           const rows = lines.slice(1).map(l => {
-            const cols = []; let cur='', inQ=false;
-            for (const c of l) {
-              if (c==='"') inQ=!inQ;
-              else if (c===',' && !inQ) { cols.push(cur.trim()); cur=''; }
-              else cur += c;
-            }
+            const cols=[]; let cur='',inQ=false;
+            for(const c of l){if(c==='"')inQ=!inQ;else if(c===','&&!inQ){cols.push(cur.trim());cur='';}else cur+=c;}
             cols.push(cur.trim());
             return Object.fromEntries(headers.map((h,i)=>[h,(cols[i]||'').replace(/^"|"$/g,'')]));
-          }).filter(r => Object.values(r).some(v=>v));
+          }).filter(r=>Object.values(r).some(v=>v));
 
           const issues = [];
-
-          if (!headers.includes('email')) issues.push('ERROR: no email column found');
+          if (!headers.includes('email'))   issues.push('ERROR: no email column found');
+          if (!headers.includes('company')) issues.push('ERROR: no company column found');
 
           const badEmails = rows.filter(r => r.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(r.email));
           if (badEmails.length) issues.push(`WARN: ${badEmails.length} invalid email(s)`);
 
           const emails = rows.map(r=>r.email).filter(Boolean);
-          const dupes = emails.length - new Set(emails).size;
+          const dupes  = emails.length - new Set(emails).size;
           if (dupes) issues.push(`WARN: ${dupes} duplicate email(s)`);
 
           const REQUIRED = ['firstName','lastName','email','company'];
@@ -119,10 +123,8 @@ jobs:
             echo "  ❌  ERRORS found — fix before approving"
           else
             echo "  ✅  To approve and push to Marketo, run:"
-            echo ""
             echo "  Go to: Actions → 'Approve & upload to Marketo'"
             echo "  Click 'Run workflow' and enter:"
             echo "    timestamp = ${{ steps.find.outputs.timestamp }}"
-            echo ""
           fi
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
