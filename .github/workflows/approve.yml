@@ -75,7 +75,7 @@ jobs:
           const csvRaw = fs.readFileSync('${{ steps.check.outputs.csv }}', 'utf8');
           const meta   = JSON.parse(fs.readFileSync('${{ steps.check.outputs.meta }}', 'utf8'));
 
-          // ── HTTP helper ────────────────────────────────────────────────
+          // ── Helpers ────────────────────────────────────────────────────
           function request(url, opts = {}) {
             return new Promise((res, rej) => {
               const req = https.request(url, opts, r => {
@@ -83,7 +83,7 @@ jobs:
                 r.on('data', d => body += d);
                 r.on('end', () => {
                   try { res(JSON.parse(body)); }
-                  catch(e) { rej(new Error('JSON parse failed: ' + body)); }
+                  catch (e) { rej(new Error('JSON parse failed: ' + body)); }
                 });
               });
               req.on('error', rej);
@@ -91,6 +91,27 @@ jobs:
               req.end();
             });
           }
+
+          function postJson(url, token, obj) {
+            const body = JSON.stringify(obj);
+            return request(url, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(body)
+              },
+              body
+            });
+          }
+
+          const chunk = (arr, n) => {
+            const out = [];
+            for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+            return out;
+          };
+          const reasonText = r => (r.reasons || []).map(x => `${x.code} ${x.message}`).join('; ');
+          const isContact  = l => l.sfdcType === 'Contact' || !!l.sfdcContactId;
 
           async function main() {
             // 1. Authenticate
@@ -102,10 +123,10 @@ jobs:
             const token = tokenRes.access_token;
             console.log('✓ Authenticated');
 
-            // 2. Parse CSV
+            // 2. Parse CSV (blank cells are dropped so they don't overwrite existing Marketo data)
             const lines   = csvRaw.trim().split(/\r?\n/);
-            const headers = lines[0].split(',');
-            const leads   = lines.slice(1).map(line => {
+            const headers = lines[0].split(',').map(h => h.replace(/^\uFEFF/, '').trim().replace(/^"|"$/g, ''));
+            const leads   = lines.slice(1).map((line, idx) => {
               const cols = []; let cur = '', inQ = false;
               for (const c of line) {
                 if (c === '"') inQ = !inQ;
@@ -113,32 +134,115 @@ jobs:
                 else cur += c;
               }
               cols.push(cur.trim());
-              const obj = {};
-              headers.forEach((h, i) => { obj[h] = (cols[i] || '').replace(/^"|"$/g, ''); });
-              return obj;
-            }).filter(r => Object.values(r).some(v => v));
+              const data = {};
+              headers.forEach((h, i) => {
+                const v = (cols[i] || '').replace(/^"|"$/g, '').trim();
+                if (v) data[h] = v;
+              });
+              return { row: idx + 2, data };
+            }).filter(l => Object.keys(l.data).length);
 
             console.log(`→ ${leads.length} leads to process`);
 
-            // 3. Upsert leads
+            // 3. Upsert leads (Marketo accepts max 300 per call)
             console.log('→ Upserting leads...');
-            const upsertPayload = JSON.stringify({
-              action: 'createOrUpdate',
-              lookupField: 'email',
-              input: leads
-            });
-            const upsertRes = await request(`${BASE}/rest/v1/leads.json`, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(upsertPayload)
-              },
-              body: upsertPayload
-            });
-            if (!upsertRes.success) throw new Error('Upsert failed: ' + JSON.stringify(upsertRes.errors));
-            const leadIds = upsertRes.result.filter(r => r.status !== 'skipped').map(r => r.id);
-            console.log(`✓ ${leadIds.length} leads upserted`);
+            const leadIds  = [];
+            const dupeRows = [];
+            const skipped  = [];
+
+            for (const batch of chunk(leads, 300)) {
+              const res = await postJson(`${BASE}/rest/v1/leads.json`, token, {
+                action: 'createOrUpdate',
+                lookupField: 'email',
+                input: batch.map(l => l.data)
+              });
+              if (!res.success) throw new Error('Upsert failed: ' + JSON.stringify(res.errors));
+
+              res.result.forEach((r, i) => {
+                const l = batch[i];
+                if (r.status !== 'skipped') {
+                  leadIds.push(r.id);
+                } else if (r.reasons?.some(x => String(x.code) === '1007')) {
+                  dupeRows.push(l);
+                } else {
+                  skipped.push(l);
+                  console.log(`✗ Skipped row ${l.row}: ${l.data.email || '(no email)'} → ${reasonText(r)}`);
+                }
+              });
+            }
+            console.log(`✓ ${leadIds.length} upserted, ${dupeRows.length} with existing duplicates, ${skipped.length} skipped`);
+
+            // 3b. Resolve existing duplicates in Marketo
+            //     Rule: prefer SFDC Contacts; within that group (or all records if none), newest created wins
+            if (dupeRows.length) {
+              console.log(`→ Resolving ${dupeRows.length} lead(s) with existing duplicates...`);
+
+              const emails = [...new Set(dupeRows.map(l => l.data.email.toLowerCase()))];
+              const found  = [];
+              for (const group of chunk(emails, 100)) {
+                let nextPageToken;
+                do {
+                  const url = `${BASE}/rest/v1/leads.json?filterType=email`
+                    + `&filterValues=${encodeURIComponent(group.join(','))}`
+                    + `&fields=id,email,createdAt,updatedAt,sfdcType,sfdcContactId`
+                    + (nextPageToken ? `&nextPageToken=${encodeURIComponent(nextPageToken)}` : '');
+                  const res = await request(url, { headers: { 'Authorization': `Bearer ${token}` } });
+                  if (!res.success) throw new Error('Duplicate lookup failed: ' + JSON.stringify(res.errors));
+                  if (!res.result?.length) break;
+                  found.push(...res.result);
+                  nextPageToken = res.nextPageToken;
+                } while (nextPageToken);
+              }
+
+              const groups = {};
+              for (const l of found) (groups[l.email.toLowerCase()] ||= []).push(l);
+
+              const pickByEmail = {};
+              for (const [key, records] of Object.entries(groups)) {
+                const contacts = records.filter(isContact);
+                const pool = contacts.length ? contacts : records;
+                pool.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+                pickByEmail[key] = {
+                  id: pool[0].id,
+                  count: records.length,
+                  reason: contacts.length
+                    ? (contacts.length > 1 ? `newest of ${contacts.length} SFDC contacts` : 'only SFDC contact')
+                    : 'no SFDC contact, newest created'
+                };
+              }
+
+              const idInput = [];
+              for (const l of dupeRows) {
+                const pick = pickByEmail[l.data.email.toLowerCase()];
+                if (!pick) {
+                  skipped.push(l);
+                  console.log(`✗ Row ${l.row}: ${l.data.email} → duplicates reported but none found on lookup`);
+                  continue;
+                }
+                console.log(`  ↳ Row ${l.row}: ${l.data.email} — ${pick.count} duplicates, using ID ${pick.id} (${pick.reason})`);
+                idInput.push({ row: l.row, data: { ...l.data, id: pick.id } });
+              }
+
+              for (const batch of chunk(idInput, 300)) {
+                const res = await postJson(`${BASE}/rest/v1/leads.json`, token, {
+                  action: 'updateOnly',
+                  lookupField: 'id',
+                  input: batch.map(l => l.data)
+                });
+                if (!res.success) throw new Error('Duplicate update failed: ' + JSON.stringify(res.errors));
+                res.result.forEach((r, i) => {
+                  if (r.status === 'skipped') {
+                    skipped.push(batch[i]);
+                    console.log(`✗ Still skipped row ${batch[i].row}: ${batch[i].data.email} → ${reasonText(r)}`);
+                  } else {
+                    leadIds.push(r.id);
+                  }
+                });
+              }
+              console.log(`✓ Duplicates resolved — ${leadIds.length} leads ready for list`);
+            }
+
+            const uniqueIds = [...new Set(leadIds)];
 
             // 4. Create static list in Group Lists (id=12)
             console.log(`→ Creating static list "${LIST_NAME}"...`);
@@ -169,29 +273,28 @@ jobs:
               console.log(`✓ Found existing list "${LIST_NAME}" with ID ${listId}`);
             }
 
-            // 5. Add leads to list (batch in groups of 300)
-            console.log(`→ Adding ${leadIds.length} leads to list ${listId}...`);
-            const batchSize = 300;
-            for (let i = 0; i < leadIds.length; i += batchSize) {
-              const batch = leadIds.slice(i, i + batchSize);
-              const addRes = await request(
-                `${BASE}/rest/v1/lists/${listId}/leads.json`,
-                {
-                  method: 'POST',
-                  headers: {
-                    'Authorization': `Bearer ${token}`,
-                    'Content-Type': 'application/json',
-                    'Content-Length': Buffer.byteLength(JSON.stringify({ input: batch.map(id => ({ id })) }))
-                  },
-                  body: JSON.stringify({ input: batch.map(id => ({ id })) })
-                }
-              );
+            // 5. Add leads to list (batches of 300)
+            console.log(`→ Adding ${uniqueIds.length} leads to list ${listId}...`);
+            for (const [n, batch] of chunk(uniqueIds, 300).entries()) {
+              const addRes = await postJson(`${BASE}/rest/v1/lists/${listId}/leads.json`, token, {
+                input: batch.map(id => ({ id }))
+              });
               if (!addRes.success) throw new Error('Add to list failed: ' + JSON.stringify(addRes.errors));
-              console.log(`✓ Batch ${Math.floor(i/batchSize)+1}: added ${batch.length} leads`);
+              console.log(`✓ Batch ${n + 1}: added ${batch.length} leads`);
             }
 
+            // 6. Summary
             console.log('');
-            console.log(`🎉 Done! ${leadIds.length} leads uploaded and added to "${LIST_NAME}"`);
+            console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+            console.log(`  CSV rows              : ${leads.length}`);
+            console.log(`  Added to list         : ${uniqueIds.length}`);
+            console.log(`  Duplicates resolved   : ${dupeRows.length - skipped.filter(s => dupeRows.includes(s)).length}`);
+            console.log(`  Skipped               : ${skipped.length}`);
+            console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+            if (skipped.length) {
+              console.log(`::warning::${skipped.length} lead(s) not uploaded: ${skipped.map(s => `row ${s.row} (${s.data.email || 'no email'})`).join(', ')}`);
+            }
+            console.log(`🎉 Done! ${uniqueIds.length} leads uploaded and added to "${LIST_NAME}"`);
           }
 
           main().catch(err => { console.error('❌', err.message); process.exit(1); });
